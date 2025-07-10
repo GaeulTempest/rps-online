@@ -1,4 +1,4 @@
-libgl1-mesa-glx
+libgl1
 libglib2.0-0
 libsm6
 libxext6
@@ -6,3 +6,12 @@ libxrender-dev
 libgomp1
 libgstreamer1.0-0
 libgstreamer-plugins-base1.0-0
+libgtk-3-0
+libnotify4
+libnss3
+libxss1
+libxtst6
+xauth
+xvfb
+libgbm1
+libxcb1
