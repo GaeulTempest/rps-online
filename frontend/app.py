@@ -1,9 +1,7 @@
-# Frontend Streamlit dengan WebSocket Video Streaming (Tanpa STUN/WebRTC)
+# Frontend Streamlit dengan Error Handling untuk OpenCV
 # File: frontend/app.py
 import streamlit as st
-import cv2
 import numpy as np
-import mediapipe as mp
 import asyncio
 import websockets
 import json
@@ -16,16 +14,30 @@ import base64
 import io
 from PIL import Image
 
+# Try importing OpenCV dengan fallback
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+    st.warning("⚠️ OpenCV tidak tersedia. Menggunakan mode simulasi.")
+
+# Import MediaPipe
+try:
+    import mediapipe as mp
+    mp_hands = mp.solutions.hands
+    mp_drawing = mp.solutions.drawing_utils
+    MEDIAPIPE_AVAILABLE = True
+except ImportError:
+    MEDIAPIPE_AVAILABLE = False
+    st.warning("⚠️ MediaPipe tidak tersedia. Deteksi gesture akan disimulasikan.")
+
 # Konfigurasi halaman Streamlit
 st.set_page_config(
     page_title="Gunting Batu Kertas Online",
     page_icon="✂️",
     layout="wide"
 )
-
-# Inisialisasi MediaPipe Hands
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
 
 # State management untuk game
 @dataclass
@@ -54,67 +66,77 @@ if "ws_thread" not in st.session_state:
 if "camera_thread" not in st.session_state:
     st.session_state.camera_thread = None
 
-# URL Backend WebSocket - sesuaikan dengan deployment Railway
+# URL Backend WebSocket
 BACKEND_WS_URL = st.text_input(
     "Backend WebSocket URL",
     value="ws://localhost:8000/ws",
     help="Masukkan URL WebSocket backend (contoh: wss://your-app.railway.app/ws)"
 )
 
-# Fungsi untuk klasifikasi gesture berdasarkan finger detection
+# Fungsi simulasi gesture untuk fallback
+def simulate_gesture():
+    """Simulasi gesture jika OpenCV/MediaPipe tidak tersedia"""
+    gestures = ["rock", "paper", "scissors"]
+    return np.random.choice(gestures)
+
+# Fungsi untuk klasifikasi gesture
 def classify_gesture(hand_landmarks) -> Optional[str]:
-    """
-    Adaptasi dari kode main.py untuk klasifikasi gesture
-    Menggunakan MediaPipe hand landmarks untuk deteksi rock, paper, scissors
-    """
-    if not hand_landmarks:
+    """Klasifikasi gesture dari MediaPipe landmarks"""
+    if not hand_landmarks or not MEDIAPIPE_AVAILABLE:
         return None
     
-    # Ambil koordinat landmarks
     landmarks = hand_landmarks.landmark
-    
-    # Deteksi jari yang terangkat
     fingers_up = []
     
-    # Thumb (ibu jari) - cek apakah tip lebih ke kiri/kanan dari IP joint
-    if landmarks[4].x < landmarks[3].x:  # Untuk tangan kanan
+    # Thumb
+    if landmarks[4].x < landmarks[3].x:
         fingers_up.append(1 if landmarks[4].x < landmarks[3].x else 0)
-    else:  # Untuk tangan kiri
+    else:
         fingers_up.append(1 if landmarks[4].x > landmarks[3].x else 0)
     
-    # 4 jari lainnya - cek apakah tip lebih tinggi dari PIP joint
+    # Other fingers
     for finger_tip, finger_pip in [(8, 6), (12, 10), (16, 14), (20, 18)]:
         fingers_up.append(1 if landmarks[finger_tip].y < landmarks[finger_pip].y else 0)
     
-    # Klasifikasi gesture berdasarkan pattern jari
     total_fingers = sum(fingers_up)
     
     if total_fingers == 0:
-        return "rock"  # Semua jari tertutup = Batu
+        return "rock"
     elif total_fingers == 5:
-        return "paper"  # Semua jari terbuka = Kertas
+        return "paper"
     elif total_fingers == 2 and fingers_up[1] == 1 and fingers_up[2] == 1:
-        return "scissors"  # Jari telunjuk dan tengah = Gunting
+        return "scissors"
     
-    return None  # Gesture tidak dikenali
+    return None
 
-# Fungsi untuk encode frame ke base64
+# Fungsi encode/decode frame
 def encode_frame(frame):
-    """Encode numpy array frame ke base64 string"""
-    _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
-    return base64.b64encode(buffer).decode('utf-8')
+    """Encode frame ke base64"""
+    if CV2_AVAILABLE:
+        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
+        return base64.b64encode(buffer).decode('utf-8')
+    else:
+        # Fallback: encode PIL Image
+        img = Image.fromarray(frame)
+        buffer = io.BytesIO()
+        img.save(buffer, format='JPEG', quality=50)
+        return base64.b64encode(buffer.getvalue()).decode('utf-8')
 
-# Fungsi untuk decode frame dari base64
 def decode_frame(frame_str):
-    """Decode base64 string ke numpy array frame"""
+    """Decode base64 ke frame"""
     try:
         img_data = base64.b64decode(frame_str)
-        nparr = np.frombuffer(img_data, np.uint8)
-        return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if CV2_AVAILABLE:
+            nparr = np.frombuffer(img_data, np.uint8)
+            return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        else:
+            # Fallback: use PIL
+            img = Image.open(io.BytesIO(img_data))
+            return np.array(img)
     except:
         return None
 
-# WebSocket client handler
+# WebSocket client handler (sama seperti sebelumnya)
 class WebSocketClient:
     def __init__(self, url: str, client_id: str, message_queue: queue.Queue):
         self.url = f"{url}/{client_id}"
@@ -130,7 +152,6 @@ class WebSocketClient:
             st.session_state.game_state.ws_connected = True
             self.running = True
             
-            # Start receiving messages
             await asyncio.gather(
                 self.receive_messages(),
                 self.process_outgoing_messages()
@@ -145,8 +166,6 @@ class WebSocketClient:
             while self.running and self.websocket:
                 message = await self.websocket.recv()
                 data = json.loads(message)
-                
-                # Process berdasarkan event type
                 event = data.get("event")
                 
                 if event == "room_created":
@@ -162,7 +181,6 @@ class WebSocketClient:
                 elif event == "game_ready":
                     st.session_state.game_state.game_status = "ready"
                     players = data.get("players", {})
-                    # Set opponent name
                     for pid, pinfo in players.items():
                         if pid != self.client_id:
                             st.session_state.game_state.opponent_name = pinfo["name"]
@@ -176,7 +194,6 @@ class WebSocketClient:
                     st.rerun()
                     
                 elif event == "video_frame":
-                    # Terima video frame dari opponent
                     frame_data = data.get("frame")
                     if frame_data:
                         frame = decode_frame(frame_data)
@@ -187,7 +204,6 @@ class WebSocketClient:
                     st.session_state.game_state.last_result = data
                     st.session_state.game_state.game_status = "result"
                     st.session_state.game_state.camera_active = False
-                    # Update scores
                     if "scores" in data:
                         st.session_state.game_state.scores = data["scores"]
                     st.rerun()
@@ -208,7 +224,6 @@ class WebSocketClient:
         """Kirim pesan ke server"""
         while self.running:
             try:
-                # Check queue for messages
                 if not self.message_queue.empty():
                     message = self.message_queue.get()
                     if self.websocket:
@@ -223,19 +238,42 @@ class WebSocketClient:
         if self.websocket:
             await self.websocket.close()
 
-# Camera handler untuk capture dan process video
+# Camera handler dengan fallback
 def camera_handler():
-    """Handle camera capture dan hand detection"""
+    """Handle camera capture dengan fallback jika OpenCV tidak tersedia"""
+    if not CV2_AVAILABLE:
+        # Mode simulasi tanpa OpenCV
+        while st.session_state.game_state.camera_active:
+            if st.session_state.game_state.game_status == "playing" and not st.session_state.game_state.gesture_locked:
+                # Simulasi deteksi gesture
+                time.sleep(3)  # Simulasi countdown
+                gesture = simulate_gesture()
+                st.session_state.game_state.current_gesture = gesture
+                st.session_state.game_state.gesture_locked = True
+                
+                # Kirim move ke server
+                if st.session_state.game_state.room_id:
+                    st.session_state.message_queue.put({
+                        "event": "player_move",
+                        "room_id": st.session_state.game_state.room_id,
+                        "move": gesture
+                    })
+            time.sleep(0.1)
+        return
+    
+    # Mode normal dengan OpenCV
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     
-    hands = mp_hands.Hands(
-        static_image_mode=False,
-        max_num_hands=1,
-        min_detection_confidence=0.7,
-        min_tracking_confidence=0.5
-    )
+    hands = None
+    if MEDIAPIPE_AVAILABLE:
+        hands = mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.5
+        )
     
     gesture_start_time = None
     last_gesture = None
@@ -247,70 +285,61 @@ def camera_handler():
         if not ret:
             continue
         
-        # Flip untuk mirror effect
         frame = cv2.flip(frame, 1)
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # Proses hand detection jika game sedang playing
         if (st.session_state.game_state.game_status == "playing" and 
             not st.session_state.game_state.gesture_locked):
             
-            results = hands.process(frame_rgb)
-            
-            if results.multi_hand_landmarks:
-                for hand_landmarks in results.multi_hand_landmarks:
-                    # Draw landmarks
-                    mp_drawing.draw_landmarks(
-                        frame, hand_landmarks, mp_hands.HAND_CONNECTIONS,
-                        mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2),
-                        mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=2)
-                    )
-                    
-                    # Klasifikasi gesture
-                    gesture = classify_gesture(hand_landmarks)
-                    
-                    if gesture:
-                        if gesture != last_gesture:
-                            gesture_start_time = time.time()
-                            last_gesture = gesture
+            if hands:
+                results = hands.process(frame_rgb)
+                
+                if results.multi_hand_landmarks:
+                    for hand_landmarks in results.multi_hand_landmarks:
+                        mp_drawing.draw_landmarks(
+                            frame, hand_landmarks, mp_hands.HAND_CONNECTIONS,
+                            mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2),
+                            mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=2)
+                        )
                         
-                        st.session_state.game_state.current_gesture = gesture
+                        gesture = classify_gesture(hand_landmarks)
                         
-                        # Hitung countdown
-                        elapsed = time.time() - gesture_start_time
-                        remaining = max(0, 3 - int(elapsed))
-                        
-                        # Display countdown
-                        cv2.putText(frame, f"Gesture: {gesture.upper()}", 
-                                  (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                        cv2.putText(frame, f"Lock in: {remaining}", 
-                                  (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
-                        
-                        # Lock gesture setelah 3 detik
-                        if elapsed >= 3 and not gesture_locked:
-                            gesture_locked = True
-                            st.session_state.game_state.gesture_locked = True
+                        if gesture:
+                            if gesture != last_gesture:
+                                gesture_start_time = time.time()
+                                last_gesture = gesture
                             
-                            # Kirim move ke server
-                            if st.session_state.game_state.room_id:
-                                st.session_state.message_queue.put({
-                                    "event": "player_move",
-                                    "room_id": st.session_state.game_state.room_id,
-                                    "move": gesture
-                                })
+                            st.session_state.game_state.current_gesture = gesture
                             
-                            cv2.putText(frame, "LOCKED!", 
-                                      (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
-            else:
-                gesture_start_time = None
-                last_gesture = None
-                cv2.putText(frame, "Tunjukkan tangan Anda", 
-                          (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                            elapsed = time.time() - gesture_start_time
+                            remaining = max(0, 3 - int(elapsed))
+                            
+                            cv2.putText(frame, f"Gesture: {gesture.upper()}", 
+                                      (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                            cv2.putText(frame, f"Lock in: {remaining}", 
+                                      (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+                            
+                            if elapsed >= 3 and not gesture_locked:
+                                gesture_locked = True
+                                st.session_state.game_state.gesture_locked = True
+                                
+                                if st.session_state.game_state.room_id:
+                                    st.session_state.message_queue.put({
+                                        "event": "player_move",
+                                        "room_id": st.session_state.game_state.room_id,
+                                        "move": gesture
+                                    })
+                                
+                                cv2.putText(frame, "LOCKED!", 
+                                          (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
+                else:
+                    gesture_start_time = None
+                    last_gesture = None
+                    cv2.putText(frame, "Tunjukkan tangan Anda", 
+                              (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
-        # Store frame untuk display
         st.session_state.current_frame = frame
         
-        # Kirim frame ke opponent setiap beberapa frame (untuk efisiensi)
         if frame_count % 5 == 0 and st.session_state.game_state.room_id:
             encoded_frame = encode_frame(frame)
             st.session_state.message_queue.put({
@@ -321,14 +350,14 @@ def camera_handler():
         
         frame_count += 1
         
-        # Reset gesture_locked untuk ronde baru
         if st.session_state.game_state.gesture_locked != gesture_locked:
             gesture_locked = st.session_state.game_state.gesture_locked
         
-        time.sleep(0.03)  # ~30 FPS
+        time.sleep(0.03)
     
     cap.release()
-    hands.close()
+    if hands:
+        hands.close()
 
 # WebSocket thread starter
 def start_websocket_client(client_id: str):
@@ -337,16 +366,28 @@ def start_websocket_client(client_id: str):
         client = WebSocketClient(BACKEND_WS_URL, client_id, st.session_state.message_queue)
         await client.connect()
     
-    # Create new event loop for thread
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(run_client())
 
 # UI Components
 def show_lobby():
-    """Tampilan lobby untuk create/join room"""
+    """Tampilan lobby"""
     st.title("🎮 Gunting Batu Kertas Online")
     st.markdown("### Selamat datang! Pilih opsi untuk memulai permainan")
+    
+    # Tampilkan status library
+    col1, col2 = st.columns(2)
+    with col1:
+        if CV2_AVAILABLE:
+            st.success("✅ OpenCV tersedia")
+        else:
+            st.warning("⚠️ OpenCV tidak tersedia - Mode simulasi")
+    with col2:
+        if MEDIAPIPE_AVAILABLE:
+            st.success("✅ MediaPipe tersedia")
+        else:
+            st.warning("⚠️ MediaPipe tidak tersedia - Gesture simulasi")
     
     col1, col2 = st.columns(2)
     
@@ -357,21 +398,18 @@ def show_lobby():
         
         if st.button("Buat Room", use_container_width=True, type="primary"):
             if player_name_create:
-                # Generate player ID
                 player_id = f"player_{int(time.time() * 1000)}"
                 st.session_state.game_state.player_id = player_id
                 st.session_state.game_state.player_name = player_name_create
                 
-                # Start WebSocket connection
                 if st.session_state.ws_thread is None or not st.session_state.ws_thread.is_alive():
                     st.session_state.ws_thread = threading.Thread(
                         target=start_websocket_client,
                         args=(player_id,)
                     )
                     st.session_state.ws_thread.start()
-                    time.sleep(1)  # Wait for connection
+                    time.sleep(1)
                 
-                # Send create room message
                 st.session_state.message_queue.put({
                     "event": "create_room",
                     "player_name": player_name_create
@@ -387,21 +425,18 @@ def show_lobby():
         
         if st.button("Gabung Room", use_container_width=True, type="primary"):
             if room_id_input and player_name_join:
-                # Generate player ID
                 player_id = f"player_{int(time.time() * 1000)}"
                 st.session_state.game_state.player_id = player_id
                 st.session_state.game_state.player_name = player_name_join
                 
-                # Start WebSocket connection
                 if st.session_state.ws_thread is None or not st.session_state.ws_thread.is_alive():
                     st.session_state.ws_thread = threading.Thread(
                         target=start_websocket_client,
                         args=(player_id,)
                     )
                     st.session_state.ws_thread.start()
-                    time.sleep(1)  # Wait for connection
+                    time.sleep(1)
                 
-                # Send join room message
                 st.session_state.message_queue.put({
                     "event": "join_room",
                     "room_id": room_id_input,
@@ -411,10 +446,9 @@ def show_lobby():
                 st.success("Bergabung ke room...")
 
 def show_game_room():
-    """Tampilan game room dengan video feed"""
+    """Tampilan game room"""
     st.title("🎮 Gunting Batu Kertas Online")
     
-    # Display room info
     col1, col2, col3 = st.columns([1, 2, 1])
     
     with col1:
@@ -438,54 +472,85 @@ def show_game_room():
         else:
             st.metric("Lawan", "Menunggu...")
     
-    # Start camera thread jika belum aktif
+    # Start camera thread
     if (st.session_state.game_state.game_status in ["playing", "ready"] and
         (st.session_state.camera_thread is None or not st.session_state.camera_thread.is_alive())):
         st.session_state.game_state.camera_active = True
         st.session_state.camera_thread = threading.Thread(target=camera_handler)
         st.session_state.camera_thread.start()
     
-    # Display video feeds
+    # Display game content
     if st.session_state.game_state.game_status in ["playing", "ready"]:
-        st.markdown("### 📹 Video Feeds")
+        st.markdown("### 📹 Game View")
         
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("**Kamera Anda**")
-            # Display current frame
-            if hasattr(st.session_state, 'current_frame'):
-                frame_rgb = cv2.cvtColor(st.session_state.current_frame, cv2.COLOR_BGR2RGB)
-                st.image(frame_rgb, use_column_width=True)
-            else:
-                st.info("Menunggu kamera...")
+        if CV2_AVAILABLE:
+            # Mode normal dengan video
+            col1, col2 = st.columns(2)
             
-            # Display current gesture
-            if st.session_state.game_state.current_gesture:
-                gesture_emoji = {
-                    "rock": "✊",
-                    "paper": "✋", 
-                    "scissors": "✌️"
-                }
-                st.success(f"Gesture: {gesture_emoji.get(st.session_state.game_state.current_gesture, '')} {st.session_state.game_state.current_gesture.upper()}")
+            with col1:
+                st.markdown("**Kamera Anda**")
+                if hasattr(st.session_state, 'current_frame'):
+                    if CV2_AVAILABLE:
+                        frame_rgb = cv2.cvtColor(st.session_state.current_frame, cv2.COLOR_BGR2RGB)
+                    else:
+                        frame_rgb = st.session_state.current_frame
+                    st.image(frame_rgb, use_column_width=True)
+                else:
+                    st.info("Menunggu kamera...")
+            
+            with col2:
+                st.markdown("**Kamera Lawan**")
+                if st.session_state.game_state.opponent_frame is not None:
+                    if CV2_AVAILABLE:
+                        frame_rgb = cv2.cvtColor(st.session_state.game_state.opponent_frame, cv2.COLOR_BGR2RGB)
+                    else:
+                        frame_rgb = st.session_state.game_state.opponent_frame
+                    st.image(frame_rgb, use_column_width=True)
+                else:
+                    st.info("Menunggu video lawan...")
+        else:
+            # Mode simulasi tanpa video
+            st.warning("🎮 Mode Simulasi - Kamera tidak tersedia")
+            
+            if st.session_state.game_state.game_status == "playing":
+                col1, col2, col3 = st.columns(3)
                 
-                if st.session_state.game_state.gesture_locked:
-                    st.success("✅ Gesture dikunci! Menunggu lawan...")
+                with col2:
+                    if not st.session_state.game_state.gesture_locked:
+                        st.info("Gesture akan otomatis dipilih dalam 3 detik...")
+                        if st.button("Pilih Gesture Manual", use_container_width=True):
+                            gesture = st.selectbox("Pilih gesture:", ["rock", "paper", "scissors"])
+                            st.session_state.game_state.current_gesture = gesture
+                            st.session_state.game_state.gesture_locked = True
+                            
+                            if st.session_state.game_state.room_id:
+                                st.session_state.message_queue.put({
+                                    "event": "player_move",
+                                    "room_id": st.session_state.game_state.room_id,
+                                    "move": gesture
+                                })
+                    else:
+                        st.success(f"✅ Gesture dikunci: {st.session_state.game_state.current_gesture}")
         
-        with col2:
-            st.markdown("**Kamera Lawan**")
-            # Display opponent frame
-            if st.session_state.game_state.opponent_frame is not None:
-                frame_rgb = cv2.cvtColor(st.session_state.game_state.opponent_frame, cv2.COLOR_BGR2RGB)
-                st.image(frame_rgb, use_column_width=True)
-            else:
-                st.info("Menunggu video lawan...")
+        # Display current gesture
+        if st.session_state.game_state.current_gesture:
+            gesture_emoji = {
+                "rock": "✊",
+                "paper": "✋", 
+                "scissors": "✌️"
+            }
+            st.success(f"Gesture: {gesture_emoji.get(st.session_state.game_state.current_gesture, '')} {st.session_state.game_state.current_gesture.upper()}")
+            
+            if st.session_state.game_state.gesture_locked:
+                st.success("✅ Gesture dikunci! Menunggu lawan...")
         
         # Instructions
         if st.session_state.game_state.game_status == "playing":
-            st.info("🎯 Tunjukkan gesture Anda ke kamera! Tahan selama 3 detik untuk mengunci pilihan.")
+            if CV2_AVAILABLE and MEDIAPIPE_AVAILABLE:
+                st.info("🎯 Tunjukkan gesture Anda ke kamera! Tahan selama 3 detik untuk mengunci pilihan.")
+            else:
+                st.info("🎯 Mode simulasi aktif - Gesture akan dipilih otomatis atau manual.")
     
-    # Show results
     elif st.session_state.game_state.game_status == "result":
         show_result()
 
@@ -498,7 +563,6 @@ def show_result():
         
         col1, col2, col3 = st.columns(3)
         
-        # Get moves and player info
         moves = result.get("moves", {})
         player_id = st.session_state.game_state.player_id
         
@@ -508,7 +572,6 @@ def show_result():
             "scissors": "✌️"
         }
         
-        # Display moves
         for i, (pid, move) in enumerate(moves.items()):
             with [col1, col3][i]:
                 if pid == player_id:
@@ -521,7 +584,6 @@ def show_result():
         with col2:
             st.markdown("**VS**")
             
-            # Display result
             winner_id = result.get("winner_id")
             if winner_id == player_id:
                 st.success("🎉 ANDA MENANG!")
@@ -530,7 +592,6 @@ def show_result():
             else:
                 st.error("😔 ANDA KALAH!")
         
-        # Display scores
         st.markdown("### 📊 Skor")
         if st.session_state.game_state.scores:
             score_cols = st.columns(2)
@@ -541,16 +602,13 @@ def show_result():
                     else:
                         st.metric(f"Skor {st.session_state.game_state.opponent_name or 'Lawan'}", score)
         
-        # Play again button
         col1, col2 = st.columns(2)
         with col1:
             if st.button("Main Lagi", use_container_width=True, type="primary"):
-                # Reset state untuk ronde baru
                 st.session_state.game_state.gesture_locked = False
                 st.session_state.game_state.current_gesture = None
                 st.session_state.game_state.game_status = "waiting"
                 
-                # Send play again message
                 st.session_state.message_queue.put({
                     "event": "play_again",
                     "room_id": st.session_state.game_state.room_id
@@ -560,27 +618,22 @@ def show_result():
         
         with col2:
             if st.button("Keluar", use_container_width=True):
-                # Stop camera
                 st.session_state.game_state.camera_active = False
-                # Reset all state
                 st.session_state.game_state = GameState()
                 st.rerun()
 
-# Main app logic
+# Main app
 def main():
-    # Check WebSocket connection status
     if st.session_state.game_state.ws_connected:
         st.sidebar.success("✅ Terhubung ke server")
     else:
         st.sidebar.error("❌ Tidak terhubung ke server")
     
-    # Route based on game status
     if st.session_state.game_state.game_status == "lobby":
         show_lobby()
     else:
         show_game_room()
     
-    # Debug info in sidebar
     with st.sidebar:
         st.markdown("### Debug Info")
         st.json({
@@ -588,8 +641,8 @@ def main():
             "room_id": st.session_state.game_state.room_id,
             "player_id": st.session_state.game_state.player_id,
             "ws_connected": st.session_state.game_state.ws_connected,
-            "gesture_locked": st.session_state.game_state.gesture_locked,
-            "current_gesture": st.session_state.game_state.current_gesture
+            "cv2_available": CV2_AVAILABLE,
+            "mediapipe_available": MEDIAPIPE_AVAILABLE
         })
 
 if __name__ == "__main__":
