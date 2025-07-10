@@ -1,7 +1,13 @@
-streamlit==1.29.0
-opencv-contrib-python==4.8.1.78
-mediapipe==0.10.8
-numpy==1.24.3
-websockets==12.0
-Pillow==10.1.0
-protobuf==3.20.3
+streamlit
+numpy
+asyncio
+websockets
+json # Biasanya sudah built-in, tapi tidak ada salahnya
+threading # Biasanya sudah built-in
+queue # Pastikan ini ada jika belum
+Pillow # Untuk PIL.Image
+opencv-python
+mediapipe==0.10.8 # Spesifikasikan versi ini
+cvzone
+scikit-learn # Untuk sklearn.tree
+protobuf==3.20.3 # Spesifikasikan versi protobuf ini
