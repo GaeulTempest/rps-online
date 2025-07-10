@@ -1,455 +1,768 @@
-# Backend FastAPI dengan WebSocket untuk Game GBK Online
-# File: backend/main.py
-# Deployed at: illustrious-achievement-production-b825.up.railway.app
+# Frontend Streamlit untuk GBK Online
+# File: frontend/app.py
+# Connected to: wss://illustrious-achievement-production-b825.up.railway.app/ws
 
-import json
-import uuid
-import base64
-from typing import Dict, List, Optional
-from datetime import datetime
+import streamlit as st
+import numpy as np
 import asyncio
-import logging
+import websockets
+import json
+import threading
+import queue
+from typing import Optional, Dict
+import time
+from dataclasses import dataclass
+import base64
+import io
+from PIL import Image
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import uvicorn
+# Try importing OpenCV dengan fallback
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+    st.warning("⚠️ OpenCV tidak tersedia. Menggunakan mode simulasi.")
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Import MediaPipe
+try:
+    import mediapipe as mp
+    mp_hands = mp.solutions.hands
+    mp_drawing = mp.solutions.drawing_utils
+    MEDIAPIPE_AVAILABLE = True
+except ImportError:
+    MEDIAPIPE_AVAILABLE = False
+    st.warning("⚠️ MediaPipe tidak tersedia. Deteksi gesture akan disimulasikan.")
 
-# Model data untuk game
-class Player(BaseModel):
-    id: str
-    name: str
-    score: int = 0
-    move: Optional[str] = None
-    is_ready: bool = False
-    video_enabled: bool = False
-
-class GameRoom(BaseModel):
-    room_id: str
-    players: Dict[str, Player] = {}
-    game_state: str = "waiting"  # waiting, ready, playing, finished
-    current_round: int = 1
-    max_players: int = 2
-    created_at: datetime = datetime.now()
-    round_results: List[Dict] = []
-
-# Inisialisasi FastAPI
-app = FastAPI(
-    title="GBK Online Backend",
-    description="Backend untuk Game Gunting Batu Kertas Online dengan Hand Tracking",
-    version="1.0.0"
+# Konfigurasi halaman Streamlit
+st.set_page_config(
+    page_title="Gunting Batu Kertas Online",
+    page_icon="✂️",
+    layout="wide",
+    initial_sidebar_state="collapsed"
 )
 
-# Konfigurasi CORS - PENTING untuk Streamlit Cloud
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins untuk Streamlit
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Backend WebSocket URL - SUDAH FIXED!
+BACKEND_WS_URL = "wss://illustrious-achievement-production-b825.up.railway.app/ws"
 
-# Storage untuk game rooms dan koneksi WebSocket
-game_rooms: Dict[str, GameRoom] = {}
-active_connections: Dict[str, WebSocket] = {}
-
-# Fungsi utilitas untuk evaluasi permainan
-def evaluate_game(move1: str, move2: str) -> str:
-    """
-    Evaluasi hasil permainan berdasarkan aturan GBK
-    Returns: "player1", "player2", atau "draw"
-    """
-    if move1 == move2:
-        return "draw"
-    
-    winning_combinations = {
-        ("rock", "scissors"),
-        ("paper", "rock"),
-        ("scissors", "paper")
+# Custom CSS untuk UI yang lebih menarik
+st.markdown("""
+<style>
+    .stButton > button {
+        width: 100%;
+        height: 50px;
+        font-size: 18px;
     }
+    .game-title {
+        text-align: center;
+        font-size: 48px;
+        font-weight: bold;
+        margin-bottom: 20px;
+    }
+    .room-code {
+        font-size: 36px;
+        font-weight: bold;
+        color: #FF6B6B;
+        text-align: center;
+        padding: 10px;
+        border: 3px solid #FF6B6B;
+        border-radius: 10px;
+        margin: 10px 0;
+    }
+    .score-display {
+        font-size: 24px;
+        text-align: center;
+        margin: 10px 0;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# State management untuk game
+@dataclass
+class GameState:
+    room_id: Optional[str] = None
+    player_id: Optional[str] = None
+    player_name: Optional[str] = None
+    game_status: str = "lobby"  # lobby, waiting, playing, result
+    current_gesture: Optional[str] = None
+    gesture_locked: bool = False
+    countdown_start: Optional[float] = None
+    opponent_name: Optional[str] = None
+    scores: Dict[str, int] = None
+    last_result: Optional[Dict] = None
+    ws_connected: bool = False
+    opponent_frame: Optional[np.ndarray] = None
+    camera_active: bool = False
+
+# Inisialisasi session state
+if "game_state" not in st.session_state:
+    st.session_state.game_state = GameState()
+if "message_queue" not in st.session_state:
+    st.session_state.message_queue = queue.Queue()
+if "ws_thread" not in st.session_state:
+    st.session_state.ws_thread = None
+if "camera_thread" not in st.session_state:
+    st.session_state.camera_thread = None
+if "current_frame" not in st.session_state:
+    st.session_state.current_frame = None
+
+# Fungsi untuk klasifikasi gesture
+def classify_gesture(hand_landmarks) -> Optional[str]:
+    """Klasifikasi gesture dari MediaPipe landmarks"""
+    if not hand_landmarks or not MEDIAPIPE_AVAILABLE:
+        return None
     
-    if (move1, move2) in winning_combinations:
-        return "player1"
+    landmarks = hand_landmarks.landmark
+    fingers_up = []
+    
+    # Thumb
+    if landmarks[4].x < landmarks[3].x:
+        fingers_up.append(1 if landmarks[4].x < landmarks[3].x else 0)
     else:
-        return "player2"
-
-# Fungsi untuk broadcast pesan ke semua pemain dalam room
-async def broadcast_to_room(room_id: str, message: dict, exclude_player: Optional[str] = None):
-    """Broadcast pesan ke semua pemain dalam room tertentu"""
-    if room_id not in game_rooms:
-        return
+        fingers_up.append(1 if landmarks[4].x > landmarks[3].x else 0)
     
-    room = game_rooms[room_id]
-    disconnected_players = []
+    # Other fingers
+    for finger_tip, finger_pip in [(8, 6), (12, 10), (16, 14), (20, 18)]:
+        fingers_up.append(1 if landmarks[finger_tip].y < landmarks[finger_pip].y else 0)
     
-    for player_id in room.players:
-        if player_id != exclude_player and player_id in active_connections:
-            try:
-                await active_connections[player_id].send_json(message)
-            except Exception as e:
-                logger.error(f"Error broadcasting to {player_id}: {e}")
-                disconnected_players.append(player_id)
+    total_fingers = sum(fingers_up)
     
-    # Clean up disconnected players
-    for player_id in disconnected_players:
-        if player_id in active_connections:
-            del active_connections[player_id]
-
-# Fungsi untuk relay video frame antar pemain
-async def relay_video_frame(room_id: str, sender_id: str, frame_data: str):
-    """Relay video frame dari satu pemain ke pemain lain dalam room"""
-    if room_id not in game_rooms:
-        return
+    if total_fingers == 0 or total_fingers == 1:
+        return "rock"
+    elif total_fingers >= 4:
+        return "paper"
+    elif total_fingers == 2 and fingers_up[1] == 1 and fingers_up[2] == 1:
+        return "scissors"
     
-    room = game_rooms[room_id]
-    # Kirim frame hanya ke pemain lain (bukan pengirim)
-    for player_id in room.players:
-        if player_id != sender_id and player_id in active_connections:
-            try:
-                await active_connections[player_id].send_json({
-                    "event": "video_frame",
-                    "sender_id": sender_id,
-                    "frame": frame_data
-                })
-            except:
-                pass
+    return None
 
-# Root endpoint
-@app.get("/")
-async def root():
-    return {
-        "status": "online",
-        "message": "GBK Online Backend is running on Railway!",
-        "active_rooms": len(game_rooms),
-        "active_connections": len(active_connections),
-        "websocket_url": "wss://illustrious-achievement-production-b825.up.railway.app/ws/{client_id}",
-        "version": "1.0.0"
-    }
-
-# Health check endpoint
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
-
-# WebSocket endpoint utama
-@app.websocket("/ws/{client_id}")
-async def websocket_endpoint(websocket: WebSocket, client_id: str):
-    """
-    Endpoint WebSocket untuk komunikasi real-time
-    Menangani game events dan video streaming
-    """
-    await websocket.accept()
-    active_connections[client_id] = websocket
-    logger.info(f"Client {client_id} connected. Total connections: {len(active_connections)}")
-    
+# Fungsi encode/decode frame
+def encode_frame(frame):
+    """Encode frame ke base64"""
     try:
-        while True:
-            # Terima data dari client
-            data = await websocket.receive_json()
-            event = data.get("event")
-            
-            logger.info(f"Received event '{event}' from client {client_id}")
-            
-            # Handle CREATE_ROOM event
-            if event == "create_room":
-                # Generate UUID untuk room baru
-                room_id = str(uuid.uuid4())[:8]  # 8 karakter untuk kemudahan
-                
-                # Buat room baru
-                new_room = GameRoom(room_id=room_id)
-                
-                # Tambahkan pemain pertama
-                player = Player(
-                    id=client_id,
-                    name=data.get("player_name", f"Player 1")
-                )
-                new_room.players[client_id] = player
-                game_rooms[room_id] = new_room
-                
-                logger.info(f"Room {room_id} created by {client_id}")
-                
-                # Kirim response ke pembuat room
-                await websocket.send_json({
-                    "event": "room_created",
-                    "room_id": room_id,
-                    "player_number": 1,
-                    "message": f"Room {room_id} berhasil dibuat. Menunggu pemain lain..."
-                })
-            
-            # Handle JOIN_ROOM event
-            elif event == "join_room":
-                room_id = data.get("room_id")
-                
-                # Validasi room
-                if room_id not in game_rooms:
-                    await websocket.send_json({
-                        "event": "error",
-                        "message": "Room tidak ditemukan!"
-                    })
-                    continue
-                
-                room = game_rooms[room_id]
-                
-                # Cek apakah room sudah penuh
-                if len(room.players) >= room.max_players:
-                    await websocket.send_json({
-                        "event": "error",
-                        "message": "Room sudah penuh!"
-                    })
-                    continue
-                
-                # Tambahkan pemain kedua
-                player = Player(
-                    id=client_id,
-                    name=data.get("player_name", f"Player {len(room.players) + 1}")
-                )
-                room.players[client_id] = player
-                
-                # Update state menjadi ready
-                room.game_state = "ready"
-                
-                logger.info(f"Player {client_id} joined room {room_id}")
-                
-                # Kirim konfirmasi ke pemain yang baru join
-                await websocket.send_json({
-                    "event": "joined_room",
-                    "room_id": room_id,
-                    "player_number": len(room.players),
-                    "message": "Berhasil bergabung ke room!"
-                })
-                
-                # Broadcast ke semua pemain bahwa game siap dimulai
-                await broadcast_to_room(room_id, {
-                    "event": "game_ready",
-                    "message": "Kedua pemain sudah siap! Permainan akan dimulai...",
-                    "players": {
-                        p_id: {
-                            "name": p.name,
-                            "score": p.score
-                        } for p_id, p in room.players.items()
-                    }
-                })
-                
-                # Set game state ke playing setelah delay
-                await asyncio.sleep(2)
-                room.game_state = "playing"
-                await broadcast_to_room(room_id, {
-                    "event": "game_started",
-                    "message": "Permainan dimulai! Tunjukkan gesture Anda!"
-                })
-            
-            # Handle VIDEO_FRAME event (relay video antar pemain)
-            elif event == "video_frame":
-                room_id = data.get("room_id")
-                frame_data = data.get("frame")
-                
-                if room_id and frame_data:
-                    # Relay frame ke pemain lain
-                    await relay_video_frame(room_id, client_id, frame_data)
-            
-            # Handle PLAYER_MOVE event
-            elif event == "player_move":
-                room_id = data.get("room_id")
-                move = data.get("move")  # rock, paper, atau scissors
-                
-                if room_id not in game_rooms:
-                    continue
-                
-                room = game_rooms[room_id]
-                
-                # Validasi game state
-                if room.game_state != "playing":
-                    await websocket.send_json({
-                        "event": "error",
-                        "message": "Game belum dimulai atau sudah selesai!"
-                    })
-                    continue
-                
-                # Simpan move pemain
-                if client_id in room.players:
-                    room.players[client_id].move = move
-                    
-                    logger.info(f"Player {client_id} submitted move: {move}")
-                    
-                    # Kirim konfirmasi ke pemain yang sudah submit move
-                    await websocket.send_json({
-                        "event": "move_submitted",
-                        "message": f"Gesture {move} berhasil dikirim! Menunggu lawan..."
-                    })
-                    
-                    # Cek apakah kedua pemain sudah mengirim move
-                    all_moves = [p.move for p in room.players.values()]
-                    if all(all_moves) and len(all_moves) == 2:
-                        # Evaluasi hasil
-                        player_ids = list(room.players.keys())
-                        player1_move = room.players[player_ids[0]].move
-                        player2_move = room.players[player_ids[1]].move
-                        
-                        result = evaluate_game(player1_move, player2_move)
-                        
-                        # Update score
-                        if result == "player1":
-                            room.players[player_ids[0]].score += 1
-                            winner_id = player_ids[0]
-                        elif result == "player2":
-                            room.players[player_ids[1]].score += 1
-                            winner_id = player_ids[1]
-                        else:
-                            winner_id = None
-                        
-                        # Simpan hasil ronde
-                        round_result = {
-                            "round": room.current_round,
-                            "player1": {
-                                "id": player_ids[0],
-                                "move": player1_move,
-                                "name": room.players[player_ids[0]].name
-                            },
-                            "player2": {
-                                "id": player_ids[1],
-                                "move": player2_move,
-                                "name": room.players[player_ids[1]].name
-                            },
-                            "result": result,
-                            "winner_id": winner_id
-                        }
-                        room.round_results.append(round_result)
-                        
-                        logger.info(f"Round {room.current_round} result: {result}")
-                        
-                        # Broadcast hasil ke kedua pemain
-                        await broadcast_to_room(room_id, {
-                            "event": "round_result",
-                            "round": room.current_round,
-                            "result": result,
-                            "moves": {
-                                player_ids[0]: player1_move,
-                                player_ids[1]: player2_move
-                            },
-                            "scores": {
-                                p_id: p.score for p_id, p in room.players.items()
-                            },
-                            "winner_id": winner_id,
-                            "message": f"Hasil: {result.replace('player1', room.players[player_ids[0]].name).replace('player2', room.players[player_ids[1]].name) if result != 'draw' else 'Seri!'}"
-                        })
-                        
-                        # Reset moves untuk ronde berikutnya
-                        for player in room.players.values():
-                            player.move = None
-                        
-                        room.current_round += 1
-            
-            # Handle PLAY_AGAIN event
-            elif event == "play_again":
-                room_id = data.get("room_id")
-                
-                if room_id in game_rooms:
-                    room = game_rooms[room_id]
-                    
-                    # Set pemain sebagai ready
-                    if client_id in room.players:
-                        room.players[client_id].is_ready = True
-                        
-                        # Cek apakah semua pemain ready
-                        all_ready = all(p.is_ready for p in room.players.values())
-                        
-                        if all_ready:
-                            # Reset state untuk ronde baru
-                            room.game_state = "playing"
-                            for player in room.players.values():
-                                player.is_ready = False
-                                player.move = None
-                            
-                            await broadcast_to_room(room_id, {
-                                "event": "new_round",
-                                "message": "Ronde baru dimulai!",
-                                "round": room.current_round
-                            })
-                        else:
-                            await websocket.send_json({
-                                "event": "waiting_ready",
-                                "message": "Menunggu pemain lain untuk melanjutkan..."
-                            })
-            
-            # Handle GET_ROOM_INFO event
-            elif event == "get_room_info":
-                room_id = data.get("room_id")
-                
-                if room_id in game_rooms:
-                    room = game_rooms[room_id]
-                    await websocket.send_json({
-                        "event": "room_info",
-                        "room_id": room_id,
-                        "game_state": room.game_state,
-                        "players": {
-                            p_id: {
-                                "name": p.name,
-                                "score": p.score,
-                                "is_ready": p.is_ready
-                            } for p_id, p in room.players.items()
-                        },
-                        "current_round": room.current_round
-                    })
-            
-    except WebSocketDisconnect:
-        logger.info(f"Client {client_id} disconnected")
-        
-        # Handle disconnect
-        if client_id in active_connections:
-            del active_connections[client_id]
-        
-        # Hapus pemain dari room dan notify pemain lain
-        for room_id, room in game_rooms.items():
-            if client_id in room.players:
-                player_name = room.players[client_id].name
-                del room.players[client_id]
-                
-                # Jika room kosong, hapus room
-                if len(room.players) == 0:
-                    del game_rooms[room_id]
-                    logger.info(f"Room {room_id} deleted (empty)")
-                else:
-                    # Notify pemain lain
-                    room.game_state = "waiting"
-                    await broadcast_to_room(room_id, {
-                        "event": "player_disconnected",
-                        "message": f"{player_name} telah meninggalkan permainan.",
-                        "game_state": "waiting"
-                    })
-                break
+        if CV2_AVAILABLE:
+            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 30])
+            return base64.b64encode(buffer).decode('utf-8')
+        else:
+            img = Image.fromarray(frame)
+            buffer = io.BytesIO()
+            img.save(buffer, format='JPEG', quality=30)
+            return base64.b64encode(buffer.getvalue()).decode('utf-8')
+    except:
+        return None
 
-# Endpoint untuk mendapatkan daftar room (untuk debugging)
-@app.get("/rooms")
-async def get_rooms():
-    return {
-        "total_rooms": len(game_rooms),
-        "rooms": {
-            room_id: {
-                "players": len(room.players),
-                "state": room.game_state,
-                "current_round": room.current_round,
-                "created_at": room.created_at.isoformat()
-            } for room_id, room in game_rooms.items()
-        }
-    }
+def decode_frame(frame_str):
+    """Decode base64 ke frame"""
+    try:
+        img_data = base64.b64decode(frame_str)
+        if CV2_AVAILABLE:
+            nparr = np.frombuffer(img_data, np.uint8)
+            return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        else:
+            img = Image.open(io.BytesIO(img_data))
+            return np.array(img)
+    except:
+        return None
 
-# Endpoint untuk statistik
-@app.get("/stats")
-async def get_stats():
-    total_players = sum(len(room.players) for room in game_rooms.values())
-    active_games = sum(1 for room in game_rooms.values() if room.game_state == "playing")
+# WebSocket client handler
+class WebSocketClient:
+    def __init__(self, url: str, client_id: str, message_queue: queue.Queue):
+        self.url = f"{url}/{client_id}"
+        self.client_id = client_id
+        self.message_queue = message_queue
+        self.websocket = None
+        self.running = False
+        
+    async def connect(self):
+        """Koneksi ke backend WebSocket"""
+        try:
+            self.websocket = await websockets.connect(self.url)
+            st.session_state.game_state.ws_connected = True
+            self.running = True
+            
+            await asyncio.gather(
+                self.receive_messages(),
+                self.process_outgoing_messages()
+            )
+        except Exception as e:
+            st.error(f"Koneksi WebSocket gagal: {e}")
+            st.session_state.game_state.ws_connected = False
     
-    return {
-        "total_rooms": len(game_rooms),
-        "total_players": total_players,
-        "active_games": active_games,
-        "active_connections": len(active_connections)
-    }
+    async def receive_messages(self):
+        """Terima pesan dari server"""
+        try:
+            while self.running and self.websocket:
+                message = await self.websocket.recv()
+                data = json.loads(message)
+                event = data.get("event")
+                
+                if event == "room_created":
+                    st.session_state.game_state.room_id = data["room_id"]
+                    st.session_state.game_state.game_status = "waiting"
+                    st.rerun()
+                    
+                elif event == "joined_room":
+                    st.session_state.game_state.room_id = data["room_id"]
+                    st.session_state.game_state.game_status = "waiting"
+                    st.rerun()
+                    
+                elif event == "game_ready":
+                    st.session_state.game_state.game_status = "ready"
+                    players = data.get("players", {})
+                    for pid, pinfo in players.items():
+                        if pid != self.client_id:
+                            st.session_state.game_state.opponent_name = pinfo["name"]
+                    st.rerun()
+                    
+                elif event == "game_started":
+                    st.session_state.game_state.game_status = "playing"
+                    st.session_state.game_state.gesture_locked = False
+                    st.session_state.game_state.current_gesture = None
+                    st.session_state.game_state.camera_active = True
+                    st.rerun()
+                    
+                elif event == "video_frame":
+                    frame_data = data.get("frame")
+                    if frame_data:
+                        frame = decode_frame(frame_data)
+                        if frame is not None:
+                            st.session_state.game_state.opponent_frame = frame
+                    
+                elif event == "round_result":
+                    st.session_state.game_state.last_result = data
+                    st.session_state.game_state.game_status = "result"
+                    st.session_state.game_state.camera_active = False
+                    if "scores" in data:
+                        st.session_state.game_state.scores = data["scores"]
+                    st.rerun()
+                    
+                elif event == "player_disconnected":
+                    st.session_state.game_state.game_status = "waiting"
+                    st.session_state.game_state.opponent_name = None
+                    st.session_state.game_state.opponent_frame = None
+                    st.rerun()
+                    
+        except websockets.exceptions.ConnectionClosed:
+            st.session_state.game_state.ws_connected = False
+            self.running = False
+        except Exception as e:
+            print(f"Error receiving message: {e}")
+    
+    async def process_outgoing_messages(self):
+        """Kirim pesan ke server"""
+        while self.running:
+            try:
+                if not self.message_queue.empty():
+                    message = self.message_queue.get()
+                    if self.websocket:
+                        await self.websocket.send(json.dumps(message))
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                print(f"Error sending message: {e}")
+    
+    async def close(self):
+        """Tutup koneksi"""
+        self.running = False
+        if self.websocket:
+            await self.websocket.close()
+
+# Camera handler
+def camera_handler():
+    """Handle camera capture dengan fallback"""
+    if not CV2_AVAILABLE:
+        # Mode simulasi
+        while st.session_state.game_state.camera_active:
+            if st.session_state.game_state.game_status == "playing" and not st.session_state.game_state.gesture_locked:
+                time.sleep(3)
+                gestures = ["rock", "paper", "scissors"]
+                gesture = np.random.choice(gestures)
+                st.session_state.game_state.current_gesture = gesture
+                st.session_state.game_state.gesture_locked = True
+                
+                if st.session_state.game_state.room_id:
+                    st.session_state.message_queue.put({
+                        "event": "player_move",
+                        "room_id": st.session_state.game_state.room_id,
+                        "move": gesture
+                    })
+            time.sleep(0.1)
+        return
+    
+    # Mode normal dengan OpenCV
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    
+    hands = None
+    if MEDIAPIPE_AVAILABLE:
+        hands = mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.5
+        )
+    
+    gesture_start_time = None
+    last_gesture = None
+    gesture_locked = False
+    frame_count = 0
+    
+    while st.session_state.game_state.camera_active:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        
+        frame = cv2.flip(frame, 1)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        if (st.session_state.game_state.game_status == "playing" and 
+            not st.session_state.game_state.gesture_locked):
+            
+            if hands:
+                results = hands.process(frame_rgb)
+                
+                if results.multi_hand_landmarks:
+                    for hand_landmarks in results.multi_hand_landmarks:
+                        mp_drawing.draw_landmarks(
+                            frame, hand_landmarks, mp_hands.HAND_CONNECTIONS,
+                            mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2),
+                            mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=2)
+                        )
+                        
+                        gesture = classify_gesture(hand_landmarks)
+                        
+                        if gesture:
+                            if gesture != last_gesture:
+                                gesture_start_time = time.time()
+                                last_gesture = gesture
+                            
+                            st.session_state.game_state.current_gesture = gesture
+                            
+                            elapsed = time.time() - gesture_start_time
+                            remaining = max(0, 3 - int(elapsed))
+                            
+                            cv2.putText(frame, f"Gesture: {gesture.upper()}", 
+                                      (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                            cv2.putText(frame, f"Lock in: {remaining}", 
+                                      (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+                            
+                            if elapsed >= 3 and not gesture_locked:
+                                gesture_locked = True
+                                st.session_state.game_state.gesture_locked = True
+                                
+                                if st.session_state.game_state.room_id:
+                                    st.session_state.message_queue.put({
+                                        "event": "player_move",
+                                        "room_id": st.session_state.game_state.room_id,
+                                        "move": gesture
+                                    })
+                                
+                                cv2.putText(frame, "LOCKED!", 
+                                          (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
+                else:
+                    gesture_start_time = None
+                    last_gesture = None
+                    cv2.putText(frame, "Tunjukkan tangan Anda", 
+                              (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        st.session_state.current_frame = frame
+        
+        # Kirim frame ke opponent
+        if frame_count % 10 == 0 and st.session_state.game_state.room_id:
+            encoded_frame = encode_frame(frame)
+            if encoded_frame:
+                st.session_state.message_queue.put({
+                    "event": "video_frame",
+                    "room_id": st.session_state.game_state.room_id,
+                    "frame": encoded_frame
+                })
+        
+        frame_count += 1
+        
+        if st.session_state.game_state.gesture_locked != gesture_locked:
+            gesture_locked = st.session_state.game_state.gesture_locked
+        
+        time.sleep(0.03)
+    
+    cap.release()
+    if hands:
+        hands.close()
+
+# WebSocket thread starter
+def start_websocket_client(client_id: str):
+    """Start WebSocket client in separate thread"""
+    async def run_client():
+        client = WebSocketClient(BACKEND_WS_URL, client_id, st.session_state.message_queue)
+        await client.connect()
+    
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(run_client())
+
+# UI Components
+def show_lobby():
+    """Tampilan lobby"""
+    st.markdown('<h1 class="game-title">🎮 Gunting Batu Kertas Online</h1>', unsafe_allow_html=True)
+    st.markdown("### Selamat datang! Mainkan game klasik dengan teknologi modern")
+    
+    # Info backend connection
+    with st.expander("ℹ️ Status Koneksi"):
+        st.info(f"Backend: {BACKEND_WS_URL}")
+        if CV2_AVAILABLE:
+            st.success("✅ OpenCV tersedia - Camera ready!")
+        else:
+            st.warning("⚠️ OpenCV tidak tersedia - Mode simulasi aktif")
+        if MEDIAPIPE_AVAILABLE:
+            st.success("✅ MediaPipe tersedia - Hand tracking ready!")
+        else:
+            st.warning("⚠️ MediaPipe tidak tersedia - Gesture akan disimulasikan")
+    
+    st.markdown("---")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("### 🏠 Buat Room Baru")
+        with st.form("create_room_form"):
+            player_name_create = st.text_input("Nama Anda", 
+                                              value=f"Player_{np.random.randint(1000, 9999)}",
+                                              max_chars=20)
+            create_submitted = st.form_submit_button("Buat Room", type="primary")
+            
+            if create_submitted and player_name_create:
+                player_id = f"player_{int(time.time() * 1000)}"
+                st.session_state.game_state.player_id = player_id
+                st.session_state.game_state.player_name = player_name_create
+                
+                if st.session_state.ws_thread is None or not st.session_state.ws_thread.is_alive():
+                    st.session_state.ws_thread = threading.Thread(
+                        target=start_websocket_client,
+                        args=(player_id,)
+                    )
+                    st.session_state.ws_thread.start()
+                    time.sleep(1)
+                
+                st.session_state.message_queue.put({
+                    "event": "create_room",
+                    "player_name": player_name_create
+                })
+                
+                st.success("🚀 Membuat room...")
+    
+    with col2:
+        st.markdown("### 🚪 Gabung Room")
+        with st.form("join_room_form"):
+            room_id_input = st.text_input("Room ID", 
+                                         placeholder="Masukkan 8 karakter Room ID",
+                                         max_chars=8)
+            player_name_join = st.text_input("Nama Anda",
+                                           value=f"Player_{np.random.randint(1000, 9999)}",
+                                           max_chars=20)
+            join_submitted = st.form_submit_button("Gabung Room", type="primary")
+            
+            if join_submitted and room_id_input and player_name_join:
+                player_id = f"player_{int(time.time() * 1000)}"
+                st.session_state.game_state.player_id = player_id
+                st.session_state.game_state.player_name = player_name_join
+                
+                if st.session_state.ws_thread is None or not st.session_state.ws_thread.is_alive():
+                    st.session_state.ws_thread = threading.Thread(
+                        target=start_websocket_client,
+                        args=(player_id,)
+                    )
+                    st.session_state.ws_thread.start()
+                    time.sleep(1)
+                
+                st.session_state.message_queue.put({
+                    "event": "join_room",
+                    "room_id": room_id_input,
+                    "player_name": player_name_join
+                })
+                
+                st.success("🔗 Bergabung ke room...")
+
+def show_game_room():
+    """Tampilan game room"""
+    st.markdown('<h1 class="game-title">🎮 Gunting Batu Kertas Online</h1>', unsafe_allow_html=True)
+    
+    # Room info
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col1:
+        st.markdown("**📍 Room ID**")
+        if st.session_state.game_state.room_id:
+            st.markdown(f'<div class="room-code">{st.session_state.game_state.room_id}</div>', 
+                       unsafe_allow_html=True)
+    
+    with col2:
+        status_emoji = {
+            "waiting": "⏳ Menunggu Pemain...",
+            "ready": "🔔 Bersiap...",
+            "playing": "🎮 Bermain!",
+            "result": "🏆 Hasil"
+        }
+        status = st.session_state.game_state.game_status
+        st.markdown(f"### {status_emoji.get(status, status)}")
+    
+    with col3:
+        st.markdown("**👥 Lawan**")
+        if st.session_state.game_state.opponent_name:
+            st.info(f"🎮 {st.session_state.game_state.opponent_name}")
+        else:
+            st.warning("⏳ Menunggu...")
+    
+    st.markdown("---")
+    
+    # Start camera thread
+    if (st.session_state.game_state.game_status in ["playing", "ready"] and
+        (st.session_state.camera_thread is None or not st.session_state.camera_thread.is_alive())):
+        st.session_state.game_state.camera_active = True
+        st.session_state.camera_thread = threading.Thread(target=camera_handler)
+        st.session_state.camera_thread.start()
+    
+    # Game content
+    if st.session_state.game_state.game_status in ["playing", "ready"]:
+        if CV2_AVAILABLE:
+            # Mode dengan video
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("### 📹 Kamera Anda")
+                video_placeholder1 = st.empty()
+                gesture_placeholder1 = st.empty()
+                
+                if hasattr(st.session_state, 'current_frame') and st.session_state.current_frame is not None:
+                    frame_rgb = cv2.cvtColor(st.session_state.current_frame, cv2.COLOR_BGR2RGB)
+                    video_placeholder1.image(frame_rgb, use_column_width=True)
+                else:
+                    video_placeholder1.info("📷 Mengaktifkan kamera...")
+                
+                if st.session_state.game_state.current_gesture:
+                    gesture_emoji = {
+                        "rock": "✊",
+                        "paper": "✋", 
+                        "scissors": "✌️"
+                    }
+                    gesture_placeholder1.success(
+                        f"### {gesture_emoji.get(st.session_state.game_state.current_gesture, '')} "
+                        f"{st.session_state.game_state.current_gesture.upper()}"
+                    )
+                    
+                    if st.session_state.game_state.gesture_locked:
+                        gesture_placeholder1.success("### ✅ GESTURE DIKUNCI!")
+            
+            with col2:
+                st.markdown("### 📹 Kamera Lawan")
+                video_placeholder2 = st.empty()
+                
+                if st.session_state.game_state.opponent_frame is not None:
+                    frame_rgb = cv2.cvtColor(st.session_state.game_state.opponent_frame, cv2.COLOR_BGR2RGB)
+                    video_placeholder2.image(frame_rgb, use_column_width=True)
+                else:
+                    video_placeholder2.info("📷 Menunggu video lawan...")
+            
+            # Auto refresh untuk update video
+            time.sleep(0.1)
+            st.rerun()
+            
+        else:
+            # Mode simulasi
+            st.warning("🎮 Mode Simulasi - Kamera tidak aktif")
+            
+            if st.session_state.game_state.game_status == "playing":
+                col1, col2, col3 = st.columns([1, 2, 1])
+                
+                with col2:
+                    if not st.session_state.game_state.gesture_locked:
+                        st.info("⏳ Gesture akan otomatis dipilih dalam 3 detik...")
+                        
+                        # Manual selection
+                        gesture = st.radio("Atau pilih manual:", 
+                                         ["rock", "paper", "scissors"],
+                                         horizontal=True)
+                        
+                        if st.button("🎯 Kunci Pilihan", type="primary"):
+                            st.session_state.game_state.current_gesture = gesture
+                            st.session_state.game_state.gesture_locked = True
+                            
+                            if st.session_state.game_state.room_id:
+                                st.session_state.message_queue.put({
+                                    "event": "player_move",
+                                    "room_id": st.session_state.game_state.room_id,
+                                    "move": gesture
+                                })
+                            st.rerun()
+                    else:
+                        gesture_emoji = {
+                            "rock": "✊",
+                            "paper": "✋", 
+                            "scissors": "✌️"
+                        }
+                        st.success(
+                            f"### {gesture_emoji.get(st.session_state.game_state.current_gesture, '')} "
+                            f"{st.session_state.game_state.current_gesture.upper()} - DIKUNCI!"
+                        )
+                        st.info("⏳ Menunggu lawan...")
+        
+        # Instructions
+        if st.session_state.game_state.game_status == "playing":
+            with st.expander("📖 Cara Bermain"):
+                if CV2_AVAILABLE and MEDIAPIPE_AVAILABLE:
+                    st.write("1. Tunjukkan tangan Anda ke kamera")
+                    st.write("2. Buat gesture: ✊ Batu, ✋ Kertas, atau ✌️ Gunting")
+                    st.write("3. Tahan gesture selama 3 detik untuk mengunci")
+                    st.write("4. Tunggu hasil setelah kedua pemain selesai")
+                else:
+                    st.write("1. Pilih gesture Anda")
+                    st.write("2. Klik 'Kunci Pilihan' atau tunggu auto-select")
+                    st.write("3. Tunggu lawan membuat pilihan")
+                    st.write("4. Lihat hasil!")
+    
+    elif st.session_state.game_state.game_status == "result":
+        show_result()
+    
+    elif st.session_state.game_state.game_status == "waiting":
+        st.info("⏳ Menunggu pemain lain bergabung...")
+        st.markdown("### 📋 Cara Bermain:")
+        st.write("1. Bagikan Room ID di atas ke teman Anda")
+        st.write("2. Tunggu mereka bergabung")
+        st.write("3. Game akan otomatis dimulai!")
+
+def show_result():
+    """Tampilan hasil permainan"""
+    if st.session_state.game_state.last_result:
+        result = st.session_state.game_state.last_result
+        
+        st.markdown("### 🏆 Hasil Permainan")
+        
+        col1, col2, col3 = st.columns([2, 1, 2])
+        
+        moves = result.get("moves", {})
+        player_id = st.session_state.game_state.player_id
+        
+        gesture_emoji = {
+            "rock": "✊",
+            "paper": "✋",
+            "scissors": "✌️"
+        }
+        
+        # Display moves
+        player_moves = []
+        for pid, move in moves.items():
+            if pid == player_id:
+                player_moves.insert(0, (pid, move))  # Player di kiri
+            else:
+                player_moves.append((pid, move))  # Opponent di kanan
+        
+        with col1:
+            pid, move = player_moves[0]
+            st.markdown("### Anda")
+            st.markdown(f'<h1 style="text-align:center">{gesture_emoji.get(move, "?")}</h1>', 
+                       unsafe_allow_html=True)
+            st.markdown(f'<p style="text-align:center;font-size:24px">{move.upper()}</p>', 
+                       unsafe_allow_html=True)
+        
+        with col2:
+            st.markdown("### VS")
+            
+            # Display result
+            winner_id = result.get("winner_id")
+            if winner_id == player_id:
+                st.markdown('<h2 style="text-align:center;color:green">🎉</h2>', 
+                           unsafe_allow_html=True)
+            elif winner_id is None:
+                st.markdown('<h2 style="text-align:center;color:orange">🤝</h2>', 
+                           unsafe_allow_html=True)
+            else:
+                st.markdown('<h2 style="text-align:center;color:red">😔</h2>', 
+                           unsafe_allow_html=True)
+        
+        with col3:
+            if len(player_moves) > 1:
+                pid, move = player_moves[1]
+                st.markdown(f"### {st.session_state.game_state.opponent_name or 'Lawan'}")
+                st.markdown(f'<h1 style="text-align:center">{gesture_emoji.get(move, "?")}</h1>', 
+                           unsafe_allow_html=True)
+                st.markdown(f'<p style="text-align:center;font-size:24px">{move.upper()}</p>', 
+                           unsafe_allow_html=True)
+        
+        # Result message
+        st.markdown("---")
+        winner_id = result.get("winner_id")
+        if winner_id == player_id:
+            st.success("# 🎉 ANDA MENANG! 🎉")
+        elif winner_id is None:
+            st.info("# 🤝 SERI! 🤝")
+        else:
+            st.error("# 😔 ANDA KALAH! 😔")
+        
+        # Display scores
+        st.markdown("### 📊 Skor Saat Ini")
+        if st.session_state.game_state.scores:
+            score_cols = st.columns(2)
+            for i, (pid, score) in enumerate(st.session_state.game_state.scores.items()):
+                with score_cols[i]:
+                    if pid == player_id:
+                        st.metric("Skor Anda", score, delta=1 if winner_id == player_id else 0)
+                    else:
+                        opponent_won = winner_id and winner_id != player_id and winner_id is not None
+                        st.metric(f"Skor {st.session_state.game_state.opponent_name or 'Lawan'}", 
+                                score, delta=1 if opponent_won else 0)
+        
+        # Action buttons
+        st.markdown("---")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🎮 Main Lagi", type="primary", use_container_width=True):
+                st.session_state.game_state.gesture_locked = False
+                st.session_state.game_state.current_gesture = None
+                st.session_state.game_state.game_status = "waiting"
+                
+                st.session_state.message_queue.put({
+                    "event": "play_again",
+                    "room_id": st.session_state.game_state.room_id
+                })
+                
+                st.rerun()
+        
+        with col2:
+            if st.button("🚪 Keluar", type="secondary", use_container_width=True):
+                st.session_state.game_state.camera_active = False
+                st.session_state.game_state = GameState()
+                st.rerun()
+
+# Main app
+def main():
+    # Sidebar info
+    with st.sidebar:
+        st.markdown("### 🎮 GBK Online")
+        
+        if st.session_state.game_state.ws_connected:
+            st.success("✅ Terhubung ke server")
+        else:
+            st.error("❌ Tidak terhubung")
+        
+        st.markdown("---")
+        st.markdown("### 📊 Status")
+        st.json({
+            "status": st.session_state.game_state.game_status,
+            "room": st.session_state.game_state.room_id,
+            "player": st.session_state.game_state.player_name,
+            "opencv": CV2_AVAILABLE,
+            "mediapipe": MEDIAPIPE_AVAILABLE
+        })
+        
+        st.markdown("---")
+        st.markdown("### 🎯 Cara Bermain")
+        st.write("✊ Batu mengalahkan Gunting")
+        st.write("✋ Kertas mengalahkan Batu")
+        st.write("✌️ Gunting mengalahkan Kertas")
+    
+    # Main content
+    if st.session_state.game_state.game_status == "lobby":
+        show_lobby()
+    else:
+        show_game_room()
 
 if __name__ == "__main__":
-    # Untuk development lokal
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    main()
