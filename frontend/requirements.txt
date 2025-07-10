@@ -1,13 +1,9 @@
 streamlit
 numpy
-asyncio
 websockets
-json # Biasanya sudah built-in, tapi tidak ada salahnya
-threading # Biasanya sudah built-in
-queue # Pastikan ini ada jika belum
 Pillow # Untuk PIL.Image
 opencv-python
-mediapipe==0.10.8 # Spesifikasikan versi ini
+mediapipe==0.10.8
 cvzone
-scikit-learn # Untuk sklearn.tree
-protobuf==3.20.3 # Spesifikasikan versi protobuf ini
+scikit-learn
+protobuf==3.20.3
